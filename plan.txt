@@ -5,33 +5,34 @@ CS 4782 FINAL PROJECT — PATCHTST REPRODUCTION PLAN
 Paper: "A Time Series is Worth 64 Words: Long-term Forecasting with Transformers"
        Nie et al., ICLR 2023 (arXiv 2211.14730v2)
 
-Group size: 2-3 people
+Group size: 2 people
 Poster presentation: Tuesday, May 5, 2026
 Report + GitHub deliverable: Monday, May 12, 2026
 
 --------------------------------------------------------------------------------
-ROLES (3-person split)
+ROLES (2-person split)
 --------------------------------------------------------------------------------
 
-Person A — Data
-  Owns:        src/dataset.py
-  Deliverable: A DataLoader yielding (look_back, forecast) batches with shapes
-               (B, 7, 336) and (B, 7, 96).
+Person 1 — Data + Model
+  Owns:        src/dataset.py + src/model.py
+  Deliverables:
+    - A DataLoader yielding (look_back, forecast) batches with shapes
+      (B, 7, 336) and (B, 7, 96).
+    - An nn.Module taking (B, 7, 336) and returning (B, 7, 96).
 
-Person B — Model
-  Owns:        src/model.py
-  Deliverable: An nn.Module taking (B, 7, 336) and returning (B, 7, 96).
+Person 2 — Training + Evals
+  Owns:        src/train.py + evaluation harness
+  Deliverables:
+    - Training loop (Adam, MSE loss, early stopping, checkpointing).
+    - Eval script that reports MSE/MAE on val and test.
+    - Logging and result plots/tables.
 
-Person C — Training & Poster
-  Owns:        src/train.py + poster
-  Deliverable: Training loop + evaluation + first results table + poster.
+Both — Poster
+  Build poster together on Monday once experiments are in.
 
-A and B can work fully in parallel. C drafts the training loop on a dummy
-model/data, then plugs in real ones once they exist.
-
-For 2 people:
-  Person 1: Data + Training (combine A and C)
-  Person 2: Model + Poster (combine B and poster)
+Person 1 ships data first (Saturday), then the model (Sunday). This lets
+Person 2 develop the training loop on dummy data Saturday, then plug in
+the real components Sunday.
 
 --------------------------------------------------------------------------------
 REPO STRUCTURE (set up Saturday)
@@ -41,14 +42,14 @@ cs4782-patchtst/
   README.md
   data/                ETT CSVs (gitignored - too big to commit)
   src/
-    dataset.py         (Person A)
-    model.py           (Person B)
-    train.py           (Person C)
+    dataset.py         (Person 1)
+    model.py           (Person 1)
+    train.py           (Person 2)
     utils.py
   notebooks/
-    01_data.ipynb        (Person A)
-    02_model_smoke.ipynb (Person B)
-    03_train.ipynb       (Person C)
+    01_data.ipynb        (Person 1)
+    02_model_smoke.ipynb (Person 1)
+    03_train.ipynb       (Person 2)
   results/             plots, logs, tables
   poster/              poster PDF + LaTeX
   report/              2-page report PDF + LaTeX
@@ -64,69 +65,68 @@ SATURDAY, MAY 2 (~6 hrs)
 --------------------------------------------------------------------------------
 
 Group sync (30 min, start of day):
-  - Create GitHub repo, add everyone as collaborators
-  - Decide A / B / C roles
-  - All three: 20 min PyTorch tutorial skim
-  - All three: re-read PatchTST Section 3 with transformer mental model fresh
+  - Create GitHub repo, add both as collaborators
+  - Confirm role split
+  - Both: 20 min PyTorch tutorial skim
+  - Both: re-read PatchTST Section 3 with transformer mental model fresh
 
-Person A — Data:
-  - Cells 1-6 from Claude's data-loading walkthrough -> ETT data loaded
+Person 1 — Data:
+  - Download ETT CSVs into Drive, load with pandas, plot all 7 channels
   - Add: train/val/test split per paper (rows 0-8640 / 8640-11520 / 11520-14400)
   - Add: per-channel z-score normalization fit ONLY on train split
   - Test loading end-to-end. Don't wrap in Dataset class yet (Sunday).
 
-Person B — Model:
-  - Write src/model.py skeleton. Components in order:
-    1. Patching module (uses tensor.unfold)
-    2. nn.Linear projection + learnable position embedding
-    3. PyTorch's built-in nn.TransformerEncoder (don't write attention from scratch)
-    4. Flatten + linear forecast head
-  - Smoke test: feed torch.randn(8, 7, 336), verify output shape (8, 7, 96).
-  - No real data yet.
-
-Person C — Training scaffolding:
+Person 2 — Training scaffolding:
   - Read paper Section 4.1 (datasets, baselines, setup) and Appendix A.1.4
     (model hyperparameters)
   - Write src/train.py skeleton: argparse for hyperparameters, training loop,
     MSE/MAE evaluation, save checkpoints to Drive, log to CSV
   - Use dummy model (nn.Linear(336*7, 96*7)) and dummy data so loop runs
-    end-to-end before B and A are ready
+    end-to-end before the real model and data are ready
   - Start poster skeleton in PowerPoint or LaTeX (empty boxes with section
     titles, content filled later)
 
 End-of-day sync (~6pm, 30 min):
-  - A: data loaded + plotted
-  - B: model returns correct shape on dummy input
-  - C: training loop runs on dummy model
+  - Person 1: data loaded + plotted
+  - Person 2: training loop runs on dummy model
 
 --------------------------------------------------------------------------------
 SUNDAY, MAY 3 (~6 hrs)
 --------------------------------------------------------------------------------
 
-Person A — Real DataLoader:
-  - Wrap data into a PyTorch Dataset class with __len__ and __getitem__
-  - __getitem__(i) returns one (look_back, forecast) pair as torch.Tensor with
-    shapes (7, 336) and (7, 96)
-  - Wrap with DataLoader(batch_size=128, shuffle=True for train, num_workers=2)
-  - Add RevIN (instance normalization): subtract mean / divide by std per sample,
-    save stats to add back later
+Person 1 — Real DataLoader + Model:
 
-Person B — Polish model:
-  - Add RevIN denormalization at the output (apply saved stats from A's data)
-  - Add channel-independence reshape: (B, M, L) -> (B*M, L) before patching
-  - Match paper hyperparameters from Appendix A.1.4:
-      D = 128
-      H = 16 heads
-      3 encoder layers
-      dropout 0.2
+  Morning: DataLoader
+    - Wrap data into a PyTorch Dataset class with __len__ and __getitem__
+    - __getitem__(i) returns one (look_back, forecast) pair as torch.Tensor
+      with shapes (7, 336) and (7, 96)
+    - Wrap with DataLoader(batch_size=128, shuffle=True for train,
+      num_workers=2)
 
-Person C — Wire it together + first training run:
-  - Replace dummy model with B's model.py, replace dummy data with A's dataset.py
+  Afternoon: Model (src/model.py)
+    1. Patching module (uses tensor.unfold)
+    2. nn.Linear projection + learnable position embedding
+    3. PyTorch's built-in nn.TransformerEncoder (don't write attention
+       from scratch)
+    4. Flatten + linear forecast head
+    5. Channel-independence reshape: (B, M, L) -> (B*M, L) before patching
+    6. RevIN (instance normalization) at input + denormalization at output
+    7. Match paper hyperparameters from Appendix A.1.4:
+         D = 128
+         H = 16 heads
+         3 encoder layers
+         dropout 0.2
+    - Smoke test: feed torch.randn(8, 7, 336), verify output shape (8, 7, 96)
+
+Person 2 — Wire it together + first training run:
+  - Replace dummy model with Person 1's model.py, replace dummy data with
+    Person 1's dataset.py (work in tandem with Person 1 as soon as each
+    component is ready)
   - First real training: ETTh1, L=336, T=96, 100 epochs (early stopping),
     batch=128, Adam lr=1e-4
   - Should take ~10-20 min on T4
   - Target: MSE around 0.370 on test set. Within 10% counts as reproduction.
-  - If MSE is wildly off (e.g., > 0.5), debug Sunday night as a team
+  - If MSE is wildly off (e.g., > 0.5), debug Sunday night together
 
 End-of-day sync (~8pm, 30 min):
   - Baseline numbers in hand, or clear list of bugs to fix Monday morning
@@ -135,27 +135,23 @@ End-of-day sync (~8pm, 30 min):
 MONDAY, MAY 4 (~6 hrs)
 --------------------------------------------------------------------------------
 
-Morning: all hands on debugging if needed. This is your buffer.
+Morning (~2 hrs): both on debugging if baseline isn't working. This is your
+buffer.
 
 Once baseline works:
 
-Person A — Look-back length sweep:
-  - Train ETTh1 T=96 with L in {96, 192, 336, 512}
-  - ~4 short runs, ~30 min total
-  - Output: clean MSE-vs-L line plot for poster
+Both (~3 hrs): Extension experiments
+  - Pick and run 1-2 small extension experiments each (decide as a team)
+  - Each experiment should fit in ~30-60 min of training
+  - Produce one clean figure per experiment for the poster
+  - Person 1 and Person 2 work on separate experiments in parallel
 
-Person B — Patch-length ablation:
-  - Fix L=336, T=96, vary P in {4, 8, 16, 32}
-  - ~4 runs
-  - Output: bar chart for poster
-
-Person C — Build the poster:
+Both (~3 hrs): Build the poster
   - Use rubric sections. Embed:
       * Figure 1 from paper (PatchTST architecture, cited)
       * Reproduced baseline cell of Table 3 (MSE/MAE for ETTh1 at
         T in {96, 192, 336, 720} if time, else just T=96)
-      * A's look-back plot
-      * B's patch-length plot
+      * Your extension figures
   - 1 paragraph each: motivation, method, results, conclusion
 
 End of Monday (~8pm):
@@ -167,37 +163,68 @@ TUESDAY, MAY 5 — PRESENT
 
   - Print poster Tuesday morning
   - Practice once Monday night
-  - Each person leads ~1 minute of the 2-3 min summary:
+  - Split the 2-3 min summary in half:
       Person 1: motivation + method
-      Person 2: results
-      Person 3: independent exploration
+      Person 2: results + independent exploration
   - Be ready for Q&A on rubric items A-K
 
 ================================================================================
 PHASE 2 — REPORT + REPO (May 6 to May 12)
 ================================================================================
 
-8 experiments to split among the team. Each person owns 2-3.
+This week is for independent exploration experiments and writing up.
+Choose your own extensions as a team — aim for 3-4 experiments total
+for a 2-person group.
 
-  #  Experiment                                     Effort  Why interesting
-  -- ---------------------------------------------- ------- -----------------------------
-  1  Patch x stride 2D grid                         Low     Extends Fig 4 beyond paper
-  2  Look-back sweep on 4 datasets                  Med     Extends Fig 2
-  3  BatchNorm vs LayerNorm ablation                Low     Tests paper's footnote claim
-  4  Self-supervised pretrain + masking ratio sweep High    Extends Sec 3.2
-  5  DLinear from-scratch baseline                  Med     Honest comparison
-  6  Channel-independence stress test (synthetic)   Med     Original contribution
-  7  Attention map visualizations                   Low     Interpretability story
-  8  Cross-dataset transfer (ETTh1 -> ETTm1)        Med     Extends Sec A.5
+--------------------------------------------------------------------------------
+WEDNESDAY, MAY 6 — Plan extensions
+--------------------------------------------------------------------------------
 
-Pick 5-6 total. #3, #6, #7 are the highest-yield-per-hour for the report.
+  - Group sync: brainstorm and lock in the extension experiments
+  - Each person owns 1-2 experiments
+  - Sketch what figure/table each experiment will produce
 
-For 2 people, compress to 4: #1, #3, #6, #7.
+--------------------------------------------------------------------------------
+THURSDAY, MAY 7 — FRIDAY, MAY 8 — Run experiments
+--------------------------------------------------------------------------------
 
-Final week tasks:
-  - Run experiments
-  - Write 2-page report (PDF, group_topic_2page_report.pdf)
-  - Polish README per assignment instructions
+  - Each person runs their owned experiments
+  - Save plots, metrics, and logs to results/
+  - Use Drive for checkpoints, GitHub for small artifacts
+
+--------------------------------------------------------------------------------
+SATURDAY, MAY 9 — Buffer / extra experiments
+--------------------------------------------------------------------------------
+
+  - Buffer day for any experiments that took longer than expected
+  - Or: add a stretch experiment if the core set finished early
+
+--------------------------------------------------------------------------------
+SUNDAY, MAY 10 — Draft report
+--------------------------------------------------------------------------------
+
+  - Write the 2-page report (group_topic_2page_report.pdf)
+  - Structure per assignment: Intro, Chosen Result, Methodology, Results &
+    Analysis, Reflections, References
+  - Heavy emphasis on Methodology (sec 3), Results & Analysis (sec 4),
+    Reflections (sec 5)
+
+--------------------------------------------------------------------------------
+MONDAY, MAY 11 — Polish repo + README
+--------------------------------------------------------------------------------
+
+  - Polish README per assignment requirements (Intro, Chosen Result,
+    GitHub Contents, Re-implementation Details, Reproduction Steps,
+    Results/Insights, Conclusion, References, Acknowledgements)
+  - Make sure code/, data/, results/, poster/, report/ are all populated
+  - Add LICENSE (MIT) and final .gitignore
+  - Test: can a stranger clone the repo and reproduce baseline?
+
+--------------------------------------------------------------------------------
+MONDAY, MAY 12 — Submit
+--------------------------------------------------------------------------------
+
+  - Final pass on report and README
   - Submit GitHub repo link to Gradescope
   - Submit 2-page report to Gradescope
   - Due: May 12
