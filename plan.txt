@@ -14,14 +14,14 @@ ROLES (2-person split)
 --------------------------------------------------------------------------------
 
 Person 1 — Data + Model
-  Owns:        src/dataset.py + src/model.py
+  Owns:        code/dataset.py + code/model.py
   Deliverables:
     - A DataLoader yielding (look_back, forecast) batches with shapes
       (B, 7, 336) and (B, 7, 96).
     - An nn.Module taking (B, 7, 336) and returning (B, 7, 96).
 
 Person 2 — Training + Evals
-  Owns:        src/train.py + evaluation harness
+  Owns:        code/train.py + evaluation harness
   Deliverables:
     - Training loop (Adam, MSE loss, early stopping, checkpointing).
     - Eval script that reports MSE/MAE on val and test.
@@ -38,23 +38,24 @@ the real components Sunday.
 REPO STRUCTURE (set up Saturday)
 --------------------------------------------------------------------------------
 
-cs4782-patchtst/
+cs4782-final-project/
   README.md
-  data/                ETT CSVs (gitignored - too big to commit)
-  src/
+  data/                ETT CSVs / dataset zip
+  code/
     dataset.py         (Person 1)
     model.py           (Person 1)
     train.py           (Person 2)
     utils.py
-  notebooks/
-    01_data.ipynb        (Person 1)
-    02_model_smoke.ipynb (Person 1)
-    03_train.ipynb       (Person 2)
+    notebooks/
+      00_setup.ipynb       repo + Drive setup
+      01_data.ipynb        (Person 1)
+      02_model_smoke.ipynb (Person 1)
+      03_train.ipynb       (Person 2)
   results/             plots, logs, tables
   poster/              poster PDF + LaTeX
   report/              2-page report PDF + LaTeX
   LICENSE              MIT
-  .gitignore           ignore data/, *.pt, __pycache__
+  .gitignore           ignore *.pt, __pycache__, .DS_Store
 
 ================================================================================
 PHASE 1 — POSTER (Sat May 2 to Tue May 5)
