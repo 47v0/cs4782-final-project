@@ -1,0 +1,386 @@
+================================================================================
+PATCHTST EXTENSION PLAN — "BEAT THE PAPER" ON ETTH1 T=96
+================================================================================
+
+Baseline (this repo, current main):
+  ETTh1 L=336 T=96  ->  MSE 0.3851  MAE 0.4024
+Paper target (PatchTST/42, Table 3):
+  ETTh1 L=336 T=96  ->  MSE 0.3750  MAE 0.3990
+
+We are 2.7% over on MSE, 0.85% over on MAE — already within the 10% band.
+The bar for "beating the paper" is MSE < 0.375 AND MAE < 0.399.
+
+State-of-the-art context (May 2026, public benchmarks for ETTh1, T=96):
+  PatchTST/42 (2023, Nie et al.)     0.375 / 0.399
+  TimesNet      (2023, Wu et al.)    0.384 / 0.402
+  iTransformer  (2024, Liu et al.)   0.386 / 0.405
+  TimeMixer     (2024, Wang et al.)  0.375 / 0.400
+  PathFormer    (2024, Chen et al.)  0.380 / 0.402
+
+Honest read: PatchTST/42 is hard to beat *cleanly* on this exact cell. Most 2024
+papers tie or slightly under-perform it. So our extension story has two arcs:
+  (a) close our 3% gap to the paper number (likely)
+  (b) inch ahead via one or two well-motivated modifications (stretch)
+
+A well-defended set of extensions that *don't* beat 0.375 is still a strong
+deliverable — the rubric values careful experimentation and reflection over raw
+numbers (final_deliverables.pdf, "Grading", bullets 2 and 3).
+
+--------------------------------------------------------------------------------
+EVALUATION DISCIPLINE (apply uniformly across all extensions)
+--------------------------------------------------------------------------------
+
+To make comparisons trustworthy:
+
+  - Same data pipeline (dataset.py, paper splits, train-only z-score) for every run.
+  - Same seed (2021) for the headline number; report ±std over 3 seeds (2019,
+    2020, 2021) in the report. Paper reports ±std over 5 seeds in §A.6.1.
+  - Single change per experiment — never combine two ideas in the same run
+    until each has been measured alone (so we can attribute gains).
+  - Always log to results/logs/<extension_tag>.csv via the existing CSVLogger.
+  - Always save the best checkpoint to results/checkpoints/<extension_tag>.pt.
+  - Report on all four horizons T in {96, 192, 336, 720} for the report (full
+    Table 3 row); just T=96 is enough for the poster if time-constrained.
+
+================================================================================
+TIER 1 — EASY GAP-CLOSERS (Sunday night / Monday morning, ~30 min each)
+================================================================================
+
+These directly address the deviations our own baseline review flagged. Goal:
+close the 3% MSE gap to the paper, ideally land at 0.375 ± 0.005.
+
+--------------------------------------------------------------------------------
+T1A. BatchNorm in the encoder block (replace LayerNorm)
+--------------------------------------------------------------------------------
+
+HYPOTHESIS
+  Paper uses BatchNorm inside the transformer block (footnote, p.5 of
+  arXiv:2211.14730v2). Their §A.4.4 ablation attributes ~1-2% MSE to this
+  choice on ETT datasets. Our use of LayerNorm (PyTorch's nn.TransformerEncoder
+  default) is the single largest known deviation; fixing it should account for
+  most of our 3% gap.
+
+CITATION
+  - Nie et al. 2023, ICLR — footnote on p.5: "Zerveas et al. (2021) has shown
+    that BatchNorm outperforms LayerNorm in time series Transformer."
+  - Zerveas et al. 2021, KDD — original Time Series Transformer (TST) paper.
+
+IMPLEMENTATION
+  Replace nn.TransformerEncoderLayer with a custom block that uses BN1d in
+  place of LayerNorm. Skeleton in code/model.py:
+
+    class BNTransformerEncoderLayer(nn.Module):
+        def __init__(self, d_model, nhead, dim_feedforward, dropout):
+            super().__init__()
+            self.attn  = nn.MultiheadAttention(d_model, nhead, dropout=dropout,
+                                               batch_first=True)
+            self.ff    = nn.Sequential(
+                nn.Linear(d_model, dim_feedforward), nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(dim_feedforward, d_model),
+            )
+            self.bn1   = nn.BatchNorm1d(d_model)
+            self.bn2   = nn.BatchNorm1d(d_model)
+            self.drop  = nn.Dropout(dropout)
+
+        def forward(self, x):                           # x: (B, N, D)
+            a, _ = self.attn(x, x, x, need_weights=False)
+            x    = self.bn1((x + self.drop(a)).transpose(1,2)).transpose(1,2)
+            f    = self.ff(x)
+            x    = self.bn2((x + self.drop(f)).transpose(1,2)).transpose(1,2)
+            return x
+
+  Note: BN1d expects (B, C, L) — hence the transposes. Stack n_layers of
+  these in place of nn.TransformerEncoder.
+
+EXPECTED IMPACT
+  -1 to -2% MSE (per paper's own ablation). Closes most of our gap.
+
+EFFORT
+  ~30 min coding, ~5 min training.
+
+--------------------------------------------------------------------------------
+T1B. Full RevIN with learnable affine (γ, β)
+--------------------------------------------------------------------------------
+
+HYPOTHESIS
+  We currently do parameter-free instance norm (subtract mean, divide std,
+  undo at output). The original RevIN paper (Kim et al. 2022) includes
+  learnable per-channel affine scale γ and shift β applied AFTER normalization
+  and BEFORE the model (and inverted at the output). The affine adds
+  flexibility for the model to retain a per-channel scale if useful.
+
+CITATION
+  Kim et al. 2022, ICLR — "Reversible Instance Normalization for Accurate
+  Time-Series Forecasting against Distribution Shift". OpenReview cGDAkQo1C0p.
+
+IMPLEMENTATION
+  Add two learnable parameters of shape (1, M, 1) inside model.py and apply
+  them after subtract-mean-divide-std at input, invert at output.
+
+EXPECTED IMPACT
+  -0.5 to -1% MSE (paper's own RevIN ablation, §A.4.4 of arXiv:2211.14730v2,
+  shows similar magnitude).
+
+EFFORT
+  ~15 min coding, ~5 min training.
+
+================================================================================
+TIER 2 — TRYING TO INCH AHEAD (Monday afternoon, ~1-2 hr each)
+================================================================================
+
+These borrow ideas from post-PatchTST forecasting work. Each has a defensible
+mechanism for *why* it might help on ETTh1 specifically.
+
+--------------------------------------------------------------------------------
+T2A. Rotary Position Embedding (RoPE) replacing learnable additive pos_emb
+--------------------------------------------------------------------------------
+
+HYPOTHESIS
+  Our baseline uses an additive learnable position embedding (1, N, D) added
+  to patch tokens. RoPE encodes position by rotating Q and K vectors before
+  attention; it (i) introduces no extra parameters, (ii) generalizes to longer
+  sequences than seen at training, and (iii) has been the de-facto standard in
+  modern transformers (LLaMA, GPT-NeoX, etc.). For time series, RoPE's relative-
+  position semantics may model the *temporal distance between patches* better
+  than absolute learnable embeddings.
+
+CITATION
+  - Su et al. 2021, "RoFormer: Enhanced Transformer with Rotary Position
+    Embedding", arXiv:2104.09864.
+  - Used in LLaMA (Touvron et al. 2023), broadly adopted since.
+
+IMPLEMENTATION
+  Drop self.pos_emb. Inside the (custom) attention, rotate Q and K by RoPE
+  matrices before the dot product. ~30 lines of standard code; reference
+  implementations are everywhere.
+
+EXPECTED IMPACT
+  Small — 0 to -0.5% MSE. May help more on longer horizons (T=720) than T=96.
+  Worth reporting as an honest negative result if it doesn't help.
+
+EFFORT
+  ~1 hr coding, ~10 min training.
+
+--------------------------------------------------------------------------------
+T2B. Trend-residual decomposition + dual-stream patch transformer
+--------------------------------------------------------------------------------
+
+HYPOTHESIS
+  ETTh1 has a strong yearly seasonal trend on top of higher-frequency residuals.
+  PatchTST treats both as one signal. DLinear (Zeng et al. 2022) showed that
+  decomposing into a moving-average trend + residual and modeling them
+  separately helps a lot. We add the same decomposition to PatchTST: run two
+  independent PatchTST encoders (shared weights or separate) on the trend and
+  the residual, sum their forecasts, undo RevIN.
+
+CITATION
+  - Zeng et al. 2022, "Are Transformers Effective for Time Series Forecasting?",
+    AAAI 2023 — DLinear / NLinear.
+  - Wu et al. 2021, "Autoformer", NeurIPS — same decomposition, embedded in
+    transformer block.
+
+IMPLEMENTATION
+  Add a moving-average-based decomposition (window=25 hours typical) at the
+  top of forward(). Run two PatchTST forward passes, one per stream. Sum.
+
+EXPECTED IMPACT
+  -0.5 to -2% MSE. ETTh1's daily/weekly periodicity makes it a good fit for
+  this. Could be the single biggest extension win.
+
+EFFORT
+  ~1.5 hr coding, ~10 min training.
+
+--------------------------------------------------------------------------------
+T2C. iTransformer cross-channel attention as a complementary stream
+--------------------------------------------------------------------------------
+
+HYPOTHESIS
+  PatchTST is strictly channel-independent: each of the 7 ETTh1 channels is
+  processed in isolation. iTransformer (Liu et al. 2024) flips this, treating
+  each variate as a token and attending across variates. On ETTh1 the load
+  channels (HUFL, MUFL, LUFL) and the oil temperature OT are causally linked,
+  so explicit cross-channel attention has at least a hypothesis. We *don't*
+  expect iTransformer alone to beat PatchTST (it doesn't, in the numbers
+  above), but a *fused* model that sums PatchTST and iTransformer logits could
+  capture both inductive biases and out-perform either alone.
+
+CITATION
+  Liu et al. 2024, ICLR — "iTransformer: Inverted Transformers Are Effective
+  for Time Series Forecasting".
+
+IMPLEMENTATION
+  Build a small iTransformer (just channel-as-token attention with one or two
+  encoder layers and a Linear head producing 7 x 96). Train alongside or
+  ensemble with PatchTST predictions: pred = α * patchtst + (1-α) * itransformer,
+  with α tuned on val set.
+
+EXPECTED IMPACT
+  Variable. -0.5% MSE if the two models genuinely capture complementary
+  signal; null result is also informative for the report.
+
+EFFORT
+  ~2 hr coding, ~15 min training each.
+
+================================================================================
+TIER 3 — TRAINING / GENERALIZATION TRICKS (Monday evening, ~30 min each)
+================================================================================
+
+Lower-risk ideas — won't break the model, may stack with Tier 1/2 wins.
+
+--------------------------------------------------------------------------------
+T3A. Multi-seed averaging
+--------------------------------------------------------------------------------
+
+HYPOTHESIS
+  Paper (§A.6.1) reports std over 5 seeds: ETTh1 T=96 mean MSE 0.376 ± 0.0012.
+  A single-seed run can be off by ±0.005 MSE. Train 5 seeds, ensemble at
+  inference (average predictions, not weights).
+
+CITATION
+  Standard practice; PatchTST §A.6.1.
+
+IMPLEMENTATION
+  for seed in [2019, 2020, 2021, 2022, 2023]: train, save preds.
+  Final = mean of saved preds.
+
+EXPECTED IMPACT
+  -0.2 to -0.7% MSE from variance reduction alone. Cheap.
+
+EFFORT
+  5x training time (so ~10 min), ~10 min code.
+
+--------------------------------------------------------------------------------
+T3B. Output-space test-time augmentation (TTA)
+--------------------------------------------------------------------------------
+
+HYPOTHESIS
+  At inference, predict not just for window starting at t but also at
+  t-1, t-2, ..., t-k. Average the k+1 predictions for the overlapping
+  forecast horizon. Costs k+1x compute at eval, free regularizer.
+
+CITATION
+  Standard TTA in vision; rarer in TS — would be a small original contribution.
+
+IMPLEMENTATION
+  In _run_epoch's eval branch, for each batch construct k shifted copies and
+  average predictions where they overlap.
+
+EXPECTED IMPACT
+  -0.1 to -0.5% MSE. Diminishing returns past k=4.
+
+EFFORT
+  ~30 min coding, no extra training.
+
+--------------------------------------------------------------------------------
+T3C. Hyperparameter sweep on patch_len, stride, dropout, lr
+--------------------------------------------------------------------------------
+
+HYPOTHESIS
+  Paper §A.4.1 sweeps patch length P in {2, 4, 8, 12, 16, 24, 32, 40} and
+  finds P=16 is *not always* best — for ETT specifically the curve is fairly
+  flat. We sweep more aggressively over (P, stride, dropout, lr) on val and
+  pick the best configuration before reporting on test.
+
+CITATION
+  PatchTST §A.4.1 (varying patch length).
+
+IMPLEMENTATION
+  Small grid: P in {8, 12, 16}, stride in {4, 8, 12}, dropout in {0.1, 0.2, 0.3},
+  lr in {5e-5, 1e-4, 2e-4}. ~3*3*3*3 = 81 runs is too many; prune to ~20 with
+  Optuna or random search.
+
+EXPECTED IMPACT
+  -0.3 to -1% MSE. Risk: overfitting val set. Mitigate by reporting best-on-val
+  config and its test number, not best-on-test.
+
+EFFORT
+  ~30 min coding, hours of GPU time. Run overnight if you want.
+
+================================================================================
+TIER 4 — STRETCH (only if Tier 1+2 finish early)
+================================================================================
+
+T4A. SSM/Mamba block as a drop-in replacement for transformer encoder
+     - Uses state-space model instead of self-attention. Faster, often
+       comparable on long sequences. Reference: Gu & Dao 2023.
+     - Major architectural surgery; only attempt if you have a full afternoon.
+
+T4B. Continuous wavelet transform features
+     - Compute scalogram per channel, concatenate as extra input features.
+     - Captures multi-resolution structure that patches alone miss.
+
+T4C. Transfer learning: pre-train on Electricity, fine-tune on ETTh1
+     - Paper §4.2 / Table 5 already shows this works. Re-running it on our
+       impl is a clean reproduction-of-extension.
+
+================================================================================
+PROPOSED ORDER OF OPERATIONS (for hitting the poster deadline)
+================================================================================
+
+  Sunday late evening:
+    [ ] T1A  BatchNorm                               (poster-ready table row 1)
+    [ ] T1B  Learnable RevIN affine                  (poster-ready table row 2)
+
+  Monday morning (~3 hr):
+    [ ] T2B  Trend-residual decomposition            (likely the biggest win)
+    [ ] T3A  Multi-seed averaging on best variant    (variance reduction)
+
+  Monday afternoon (~3 hr):
+    [ ] T2A  RoPE                                    (negative result is OK)
+    [ ] Multi-horizon table: rerun BEST variant on T in {192, 336, 720}
+
+  Monday evening:
+    [ ] Build poster with results from above.
+
+  Phase 2 (May 6-12):
+    [ ] T2C  iTransformer + PatchTST ensemble       (paper-worthy comparison)
+    [ ] T3B  Test-time augmentation                  (cheap last-mile)
+    [ ] T3C  Hyperparameter sweep                    (overnight on Friday)
+    [ ] Stretch: T4A, T4B, T4C as time allows.
+
+================================================================================
+RESULTS TRACKER (fill in as you go)
+================================================================================
+
+ETTh1, L=336, T=96:
+
+| Run                                | MSE    | MAE    | dMSE vs paper | Notes |
+|------------------------------------|--------|--------|---------------|-------|
+| Paper (Nie et al. 2023)            | 0.375  | 0.399  | (target)      |       |
+| Ours, baseline                     | 0.3851 | 0.4024 | +2.7%         |       |
+| + T1A BatchNorm                    |        |        |               |       |
+| + T1B Learnable RevIN              |        |        |               |       |
+| + T1A + T1B                        |        |        |               |       |
+| + T2A RoPE                         |        |        |               |       |
+| + T2B Trend-residual decomp        |        |        |               |       |
+| + T2C PatchTST + iTransformer ens. |        |        |               |       |
+| + T3A Multi-seed (best variant)    |        |        |               |       |
+| + T3B TTA (best variant)           |        |        |               |       |
+| Final best                         |        |        |               |       |
+
+Multi-horizon (best variant only, fill once we have a winner):
+
+| T   | Paper MSE | Paper MAE | Ours MSE | Ours MAE |
+|-----|-----------|-----------|----------|----------|
+| 96  | 0.375     | 0.399     |          |          |
+| 192 | 0.414     | 0.421     |          |          |
+| 336 | 0.431     | 0.436     |          |          |
+| 720 | 0.449     | 0.466     |          |          |
+
+================================================================================
+KEY REFERENCES
+================================================================================
+
+  - PatchTST original:        arXiv:2211.14730 (Nie et al. 2023, ICLR)
+  - RevIN:                    OpenReview cGDAkQo1C0p (Kim et al. 2022, ICLR)
+  - DLinear / NLinear:        arXiv:2205.13504 (Zeng et al. 2023, AAAI)
+  - Autoformer (decomp idea): arXiv:2106.13008 (Wu et al. 2021, NeurIPS)
+  - iTransformer:             arXiv:2310.06625 (Liu et al. 2024, ICLR)
+  - TimesNet:                 arXiv:2210.02186 (Wu et al. 2023, ICLR)
+  - TimeMixer:                arXiv:2405.14616 (Wang et al. 2024, ICLR)
+  - PathFormer:               arXiv:2402.05956 (Chen et al. 2024, ICLR)
+  - RoPE:                     arXiv:2104.09864 (Su et al. 2021)
+  - Mamba:                    arXiv:2312.00752 (Gu & Dao 2023)
+
+================================================================================

@@ -64,6 +64,7 @@ def paper_cfg() -> Dict:
         n_layers        = 3,         # number of encoder layers
         d_ff            = 256,       # feed-forward inner dimension F (=2*D)
         dropout         = 0.2,       # dropout probability
+        norm_type       = "layer",   # "layer" (paper-default LN) | "batch" (paper footnote BN)
 
         #  Training
         batch_size      = 128,
@@ -139,6 +140,7 @@ def build_model(cfg: Dict) -> nn.Module:
         n_layers   = cfg["n_layers"],
         d_ff       = d_ff,
         dropout    = cfg["dropout"],
+        norm_type  = cfg.get("norm_type", "layer"),
     )
     return model.to(cfg["device"])
 
@@ -180,7 +182,10 @@ class Trainer:
         self.criterion = nn.MSELoss()
         self.device    = torch.device(cfg["device"])
 
+        # Suffix the tag with non-default extensions so files auto-separate.
         tag = f"{cfg['dataset']}_L{cfg['seq_len']}_T{cfg['pred_len']}"
+        if cfg.get("norm_type", "layer") == "batch":
+            tag += "_BN"
         ckpt_dir = Path(cfg["checkpoint_dir"]); ckpt_dir.mkdir(parents=True, exist_ok=True)
         log_dir  = Path(cfg["log_dir"]);        log_dir.mkdir(parents=True, exist_ok=True)
 

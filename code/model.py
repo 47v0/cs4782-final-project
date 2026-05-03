@@ -15,6 +15,42 @@ import torch
 import torch.nn as nn
 
 
+class _BNTransformerEncoderLayer(nn.Module):
+    """
+    Post-norm transformer encoder layer with BatchNorm1d in place of LayerNorm.
+
+    Per the PatchTST paper footnote (p.5, citing Zerveas et al. 2021), BatchNorm
+    outperforms LayerNorm in time-series transformer encoders. PyTorch's
+    `nn.TransformerEncoderLayer` is hardcoded to LayerNorm, so we hand-roll the
+    BN variant here.
+
+    BN1d expects (B, C, L); our token tensor is (B, N, D). We transpose to
+    (B, D, N) for the BN call and back.
+    """
+
+    def __init__(self, d_model, nhead, dim_feedforward, dropout):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(
+            d_model, nhead, dropout=dropout, batch_first=True
+        )
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, d_model),
+        )
+        self.bn1  = nn.BatchNorm1d(d_model)
+        self.bn2  = nn.BatchNorm1d(d_model)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x):                                      # x: (B, N, D)
+        a, _ = self.attn(x, x, x, need_weights=False)
+        x    = self.bn1((x + self.drop(a)).transpose(1, 2)).transpose(1, 2)
+        f    = self.ff(x)
+        x    = self.bn2((x + self.drop(f)).transpose(1, 2)).transpose(1, 2)
+        return x
+
+
 class PatchTST(nn.Module):
     """
     Channel-independent patch transformer for multivariate forecasting.
@@ -35,8 +71,10 @@ class PatchTST(nn.Module):
     def __init__(self,
                  seq_len, pred_len, patch_len, stride,
                  n_features, d_model, n_heads, n_layers,
-                 d_ff, dropout):
+                 d_ff, dropout, norm_type="layer"):
         super().__init__()
+        if norm_type not in {"layer", "batch"}:
+            raise ValueError(f"norm_type must be 'layer' or 'batch', got {norm_type!r}")
 
         self.seq_len    = seq_len
         self.pred_len   = pred_len
@@ -44,6 +82,7 @@ class PatchTST(nn.Module):
         self.stride     = stride
         self.n_features = n_features
         self.d_model    = d_model
+        self.norm_type  = norm_type
         self.n_patches  = (seq_len - patch_len) // stride + 2
 
         self.patch_proj = nn.Linear(patch_len, d_model)
@@ -51,15 +90,21 @@ class PatchTST(nn.Module):
             torch.randn(1, self.n_patches, d_model) * 0.02
         )
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model         = d_model,
-            nhead           = n_heads,
-            dim_feedforward = d_ff,
-            dropout         = dropout,
-            activation      = "gelu",
-            batch_first     = True,
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        if norm_type == "batch":
+            self.encoder = nn.Sequential(*[
+                _BNTransformerEncoderLayer(d_model, n_heads, d_ff, dropout)
+                for _ in range(n_layers)
+            ])
+        else:
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model         = d_model,
+                nhead           = n_heads,
+                dim_feedforward = d_ff,
+                dropout         = dropout,
+                activation      = "gelu",
+                batch_first     = True,
+            )
+            self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
 
         self.flatten = nn.Flatten(start_dim=-2)
         self.head    = nn.Linear(self.n_patches * d_model, pred_len)
