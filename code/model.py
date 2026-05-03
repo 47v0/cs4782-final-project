@@ -21,7 +21,6 @@ import torch
 import torch.nn as nn
 
 
-# ── RoPE helpers ──────────────────────────────────────────────────────────────
 
 def _build_rope_cache(seq_len, head_dim, device, base=10_000.0):
     inv_freq = 1.0 / (
@@ -33,23 +32,19 @@ def _build_rope_cache(seq_len, head_dim, device, base=10_000.0):
 
 
 def _apply_rope(x, cos, sin):
-    """
-    Rotation: [x1, x2] -> [x1*cos - x2*sin,  x1*sin + x2*cos]
-    """
+    """Rotation: [x1, x2] -> [x1*cos - x2*sin,  x1*sin + x2*cos]"""
     d  = x.shape[-1]
     x1 = x[..., : d // 2]
     x2 = x[..., d // 2 :]
-    cos = cos.unsqueeze(0).unsqueeze(0)   # (1, 1, N, head_dim//2) for broadcasting
+    cos = cos.unsqueeze(0).unsqueeze(0)   # (1, 1, N, head_dim//2)
     sin = sin.unsqueeze(0).unsqueeze(0)
     return torch.cat([x1 * cos - x2 * sin,
                       x1 * sin + x2 * cos], dim=-1)
 
 
 class _RoPEMultiheadAttention(nn.Module):
-    """
-    The RoPE cache is built
-    lazily and rebuilt whenever seq_len or device changes.
-    """
+    """Multi-head attention with RoPE applied to Q and K.
+    Cache is built lazily and rebuilt whenever seq_len or device changes."""
 
     def __init__(self, d_model, n_heads, dropout):
         super().__init__()
@@ -59,14 +54,11 @@ class _RoPEMultiheadAttention(nn.Module):
         self.head_dim = d_model // n_heads
         self.scale    = self.head_dim ** -0.5
 
-        # No bias on Q/K projections -- standard RoPE practice.
         self.q_proj    = nn.Linear(d_model, d_model, bias=False)
         self.k_proj    = nn.Linear(d_model, d_model, bias=False)
         self.v_proj    = nn.Linear(d_model, d_model, bias=False)
         self.o_proj    = nn.Linear(d_model, d_model)
         self.attn_drop = nn.Dropout(dropout)
-
-        # Cache: (seq_len, device_str) -> (cos, sin)
         self._rope_cache = {}
 
     def _get_rope(self, N, device):
@@ -76,7 +68,6 @@ class _RoPEMultiheadAttention(nn.Module):
         return self._rope_cache[key]
 
     def forward(self, x):
-        # x: (B, N, D)
         B, N, D = x.shape
         H, Dh   = self.n_heads, self.head_dim
 
@@ -84,7 +75,6 @@ class _RoPEMultiheadAttention(nn.Module):
             return proj(x).reshape(B, N, H, Dh).transpose(1, 2)  # (B, H, N, Dh)
 
         Q, K, V = _split(self.q_proj), _split(self.k_proj), _split(self.v_proj)
-
         cos, sin = self._get_rope(N, x.device)
         Q = _apply_rope(Q, cos, sin)
         K = _apply_rope(K, cos, sin)
@@ -93,6 +83,26 @@ class _RoPEMultiheadAttention(nn.Module):
         attn = self.attn_drop(attn.softmax(dim=-1))
         out  = (attn @ V).transpose(1, 2).reshape(B, N, D)   # (B, N, D)
         return self.o_proj(out)
+
+
+
+class _SeriesDecomp(nn.Module):
+    """Centred moving-average decomposition.  Returns (trend, residual).
+
+    AvgPool1d with symmetric padding preserves sequence length; an even kernel
+    can add one extra sample, which is trimmed.
+    """
+
+    def __init__(self, kernel_size=25):
+        super().__init__()
+        self.avg = nn.AvgPool1d(kernel_size=kernel_size, stride=1,
+                                padding=kernel_size // 2)
+
+    def forward(self, x):
+        # x: (B*M, L) -- already channel-flattened
+        trend = self.avg(x.unsqueeze(1)).squeeze(1)   # pool over time
+        trend = trend[:, : x.shape[-1]]               # trim if kernel is even
+        return trend, x - trend
 
 
 
@@ -147,42 +157,57 @@ class PatchTST(nn.Module):
     Channel-independent patch transformer for multivariate forecasting.
 
     Forward pass, given x of shape (B, M, L):
-      1. RevIN: per-instance per-channel normalize across time, save (mean, std).
+      1. RevIN: normalise per-instance per-channel; optionally apply learnable
+         affine γ·x̂ + β (E2).  Save (mean, std) for the inverse pass.
       2. Channel-independence reshape: (B, M, L) -> (B*M, L).
-      3. Patching: replicate-pad by `stride`, unfold to (B*M, N, P).
-      4. Linear projection P -> D and (if not use_rope) learnable additive
-         position embedding.
-      5. Transformer encoder with BN; attention uses RoPE if use_rope=True.
-      6. Flatten + Linear head: (B*M, N, D) -> (B*M, T).
-      7. Reshape to (B, M, T) and undo RevIN with the saved (mean, std).
+      3. [if use_decomp] split (B*M, L) into trend and residual (E3);
+         steps 4-6 run once per stream (shared weights) and outputs are summed.
+      4. Patching: replicate-pad by `stride`, unfold to (B*M, N, P).
+      5. Linear projection P -> D; add pos_emb if not use_rope (E1).
+      6. Transformer encoder with BN; attention uses RoPE if use_rope=True.
+      7. Flatten + Linear head: (B*M, N, D) -> (B*M, T).
+      8. Reshape to (B, M, T) and undo RevIN affine + normalisation.
 
-    Number of patches N = (L - P) // S + 2, where the +2 accounts for the
-    standard sliding-window count plus one extra patch from the replicate-pad.
-
+    N = (L - P) // S + 2.
     """
 
     def __init__(self,
                  seq_len, pred_len, patch_len, stride,
                  n_features, d_model, n_heads, n_layers,
                  d_ff, dropout, norm_type="batch",
-                 use_rope=True):
+                 use_rope=True,
+                 use_revin_affine=True,   
+                 use_decomp=True,       
+                 decomp_kernel=25):       
         super().__init__()
         if norm_type not in {"layer", "batch"}:
             raise ValueError(f"norm_type must be 'layer' or 'batch', got {norm_type!r}")
 
-        self.seq_len    = seq_len
-        self.pred_len   = pred_len
-        self.patch_len  = patch_len
-        self.stride     = stride
-        self.n_features = n_features
-        self.d_model    = d_model
-        self.norm_type  = norm_type
-        self.use_rope   = use_rope
-        self.n_patches  = (seq_len - patch_len) // stride + 2
+        self.seq_len          = seq_len
+        self.pred_len         = pred_len
+        self.patch_len        = patch_len
+        self.stride           = stride
+        self.n_features       = n_features
+        self.d_model          = d_model
+        self.norm_type        = norm_type
+        self.use_rope         = use_rope
+        self.use_revin_affine = use_revin_affine
+        self.use_decomp       = use_decomp
+        self.n_patches        = (seq_len - patch_len) // stride + 2
+        self._revin_eps       = 1e-5
+
+        # E2: one scale and one shift per channel, shared across B and T.
+        if use_revin_affine:
+            self.gamma = nn.Parameter(torch.ones (1, n_features, 1))
+            self.beta  = nn.Parameter(torch.zeros(1, n_features, 1))
+
+        # E3: decomposition module (no learnable parameters).
+        if use_decomp:
+            self.decomp = _SeriesDecomp(decomp_kernel)
 
         self.patch_proj = nn.Linear(patch_len, d_model)
 
-        # pos_emb only exists when RoPE is off; RoPE encodes position inside attn.
+        # pos_emb only exists when RoPE is off; RoPE carries position in attn.
         if not use_rope:
             self.pos_emb = nn.Parameter(
                 torch.randn(1, self.n_patches, d_model) * 0.02
@@ -209,39 +234,42 @@ class PatchTST(nn.Module):
         self.flatten = nn.Flatten(start_dim=-2)
         self.head    = nn.Linear(self.n_patches * d_model, pred_len)
 
-        self._revin_eps = 1e-5
+    def _encode(self, x):
+        last = x[:, -1:].expand(-1, self.stride)
+        x    = torch.cat([x, last], dim=-1)
+        x    = x.unfold(-1, self.patch_len, self.stride)     # (B*M, N, P)
+        x    = self.patch_proj(x)                            # (B*M, N, D)
+        if not self.use_rope:
+            x = x + self.pos_emb
+        x = self.encoder(x)                                  # (B*M, N, D)
+        x = self.flatten(x)                                  # (B*M, N*D)
+        return self.head(x)                                  # (B*M, T)
 
     def forward(self, x):
         # x: (B, M, L)
         B, M, L = x.shape
 
-        # 1. RevIN at input.
-        mu  = x.mean(dim=-1, keepdim=True)                            # (B, M, 1)
-        sig = x.std (dim=-1, keepdim=True) + self._revin_eps          # (B, M, 1)
+        # 1. RevIN normalisation.
+        mu  = x.mean(dim=-1, keepdim=True)                   # (B, M, 1)
+        sig = x.std (dim=-1, keepdim=True) + self._revin_eps
         x   = (x - mu) / sig
+        if self.use_revin_affine:                             # E2: affine in
+            x = self.gamma * x + self.beta
 
-        # 2. Channel-independence: merge channel into batch.
-        x = x.reshape(B * M, L)
+        # 2. Channel-independence: merge M into batch.
+        x = x.reshape(B * M, L)                              # (B*M, L)
 
-        # 3. Patching: replicate the last value `stride` times, then unfold.
-        last = x[:, -1:].expand(-1, self.stride)
-        x    = torch.cat([x, last], dim=-1)                           # (B*M, L+S)
-        x    = x.unfold(-1, self.patch_len, self.stride)              # (B*M, N, P)
+        # 3-7. Encode; if decomposing (E3), run each stream and sum.
+        if self.use_decomp:
+            trend, residual = self.decomp(x)
+            out = self._encode(trend) + self._encode(residual)
+        else:
+            out = self._encode(x)                            # (B*M, T)
 
-        # 4. Project + optionally add position embedding.
-        x = self.patch_proj(x)                                        # (B*M, N, D)
-        if not self.use_rope:
-            x = x + self.pos_emb          # RoPE carries position inside attn
-
-        # 5. Transformer encoder.
-        x = self.encoder(x)                                           # (B*M, N, D)
-
-        # 6. Flatten + head.
-        x = self.flatten(x)                                           # (B*M, N*D)
-        x = self.head(x)                                              # (B*M, T)
-
-        # 7. Un-merge channel + undo RevIN.
-        x = x.reshape(B, M, self.pred_len)                            # (B, M, T)
-        x = x * sig + mu                                              # broadcast across T
+        # 8. Reshape + undo RevIN.
+        x = out.reshape(B, M, self.pred_len)                 # (B, M, T)
+        if self.use_revin_affine:                             # E2: affine out
+            x = (x - self.beta) / (self.gamma + self._revin_eps)
+        x = x * sig + mu
 
         return x
