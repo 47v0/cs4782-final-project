@@ -9,10 +9,91 @@ Transformer encoder, flatten + linear head.
 Reference: Nie et al. 2023 (ICLR), "A Time Series is Worth 64 Words".
 Forward pipeline matches Section 3.1 and Appendix A.1.5; hyperparameter
 defaults follow Appendix A.1.4 (small-dataset override is set in train.py).
+
+Extension: Rotary Position Embedding (RoPE) -- Su et al. 2021, arXiv:2104.09864.
+  Enabled via use_rope=True in the constructor.  When active, the learnable
+  additive pos_emb is dropped and position is encoded by rotating Q and K
+  before every attention dot-product, so the model sees *relative* patch
+  distances rather than absolute indices.  Zero extra parameters.
 """
 
 import torch
 import torch.nn as nn
+
+
+# ── RoPE helpers ──────────────────────────────────────────────────────────────
+
+def _build_rope_cache(seq_len, head_dim, device, base=10_000.0):
+    inv_freq = 1.0 / (
+        base ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) / head_dim)
+    )                                                         # (head_dim // 2,)
+    positions = torch.arange(seq_len, dtype=torch.float32, device=device)
+    freqs = torch.outer(positions, inv_freq)                  # (seq_len, head_dim // 2)
+    return freqs.cos(), freqs.sin()
+
+
+def _apply_rope(x, cos, sin):
+    """
+    Rotation: [x1, x2] -> [x1*cos - x2*sin,  x1*sin + x2*cos]
+    """
+    d  = x.shape[-1]
+    x1 = x[..., : d // 2]
+    x2 = x[..., d // 2 :]
+    cos = cos.unsqueeze(0).unsqueeze(0)   # (1, 1, N, head_dim//2) for broadcasting
+    sin = sin.unsqueeze(0).unsqueeze(0)
+    return torch.cat([x1 * cos - x2 * sin,
+                      x1 * sin + x2 * cos], dim=-1)
+
+
+class _RoPEMultiheadAttention(nn.Module):
+    """
+    The RoPE cache is built
+    lazily and rebuilt whenever seq_len or device changes.
+    """
+
+    def __init__(self, d_model, n_heads, dropout):
+        super().__init__()
+        if d_model % n_heads != 0:
+            raise ValueError(f"d_model ({d_model}) must be divisible by n_heads ({n_heads})")
+        self.n_heads  = n_heads
+        self.head_dim = d_model // n_heads
+        self.scale    = self.head_dim ** -0.5
+
+        # No bias on Q/K projections -- standard RoPE practice.
+        self.q_proj    = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj    = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj    = nn.Linear(d_model, d_model, bias=False)
+        self.o_proj    = nn.Linear(d_model, d_model)
+        self.attn_drop = nn.Dropout(dropout)
+
+        # Cache: (seq_len, device_str) -> (cos, sin)
+        self._rope_cache = {}
+
+    def _get_rope(self, N, device):
+        key = (N, str(device))
+        if key not in self._rope_cache:
+            self._rope_cache[key] = _build_rope_cache(N, self.head_dim, device)
+        return self._rope_cache[key]
+
+    def forward(self, x):
+        # x: (B, N, D)
+        B, N, D = x.shape
+        H, Dh   = self.n_heads, self.head_dim
+
+        def _split(proj):
+            return proj(x).reshape(B, N, H, Dh).transpose(1, 2)  # (B, H, N, Dh)
+
+        Q, K, V = _split(self.q_proj), _split(self.k_proj), _split(self.v_proj)
+
+        cos, sin = self._get_rope(N, x.device)
+        Q = _apply_rope(Q, cos, sin)
+        K = _apply_rope(K, cos, sin)
+
+        attn = (Q @ K.transpose(-2, -1)) * self.scale        # (B, H, N, N)
+        attn = self.attn_drop(attn.softmax(dim=-1))
+        out  = (attn @ V).transpose(1, 2).reshape(B, N, D)   # (B, N, D)
+        return self.o_proj(out)
+
 
 
 class _BNTransformerEncoderLayer(nn.Module):
@@ -21,18 +102,23 @@ class _BNTransformerEncoderLayer(nn.Module):
 
     Per the PatchTST paper footnote (p.5, citing Zerveas et al. 2021), BatchNorm
     outperforms LayerNorm in time-series transformer encoders. PyTorch's
-    `nn.TransformerEncoderLayer` is hardcoded to LayerNorm, so we hand-roll the
+    nn.TransformerEncoderLayer is hardcoded to LayerNorm, so we hand-roll the
     BN variant here.
 
     BN1d expects (B, C, L); our token tensor is (B, N, D). We transpose to
     (B, D, N) for the BN call and back.
     """
 
-    def __init__(self, d_model, nhead, dim_feedforward, dropout):
+    def __init__(self, d_model, nhead, dim_feedforward, dropout, use_rope=True):
         super().__init__()
-        self.attn = nn.MultiheadAttention(
-            d_model, nhead, dropout=dropout, batch_first=True
-        )
+        if use_rope:
+            self.attn = _RoPEMultiheadAttention(d_model, nhead, dropout)
+        else:
+            self.attn = nn.MultiheadAttention(
+                d_model, nhead, dropout=dropout, batch_first=True
+            )
+        self.use_rope = use_rope
+
         self.ff = nn.Sequential(
             nn.Linear(d_model, dim_feedforward),
             nn.GELU(),
@@ -44,12 +130,17 @@ class _BNTransformerEncoderLayer(nn.Module):
         self.drop = nn.Dropout(dropout)
 
     def forward(self, x):                                      # x: (B, N, D)
-        a, _ = self.attn(x, x, x, need_weights=False)
-        x    = self.bn1((x + self.drop(a)).transpose(1, 2)).transpose(1, 2)
-        f    = self.ff(x)
-        x    = self.bn2((x + self.drop(f)).transpose(1, 2)).transpose(1, 2)
+        if self.use_rope:
+            a = self.attn(x)
+        else:
+            a, _ = self.attn(x, x, x, need_weights=False)
+        x = self.bn1((x + self.drop(a)).transpose(1, 2)).transpose(1, 2)
+        f = self.ff(x)
+        x = self.bn2((x + self.drop(f)).transpose(1, 2)).transpose(1, 2)
         return x
 
+
+# ── Main model ────────────────────────────────────────────────────────────────
 
 class PatchTST(nn.Module):
     """
@@ -59,19 +150,22 @@ class PatchTST(nn.Module):
       1. RevIN: per-instance per-channel normalize across time, save (mean, std).
       2. Channel-independence reshape: (B, M, L) -> (B*M, L).
       3. Patching: replicate-pad by `stride`, unfold to (B*M, N, P).
-      4. Linear projection P -> D and learnable additive position embedding.
-      5. Vanilla transformer encoder (LayerNorm, GELU, batch-first).
+      4. Linear projection P -> D and (if not use_rope) learnable additive
+         position embedding.
+      5. Transformer encoder with BN; attention uses RoPE if use_rope=True.
       6. Flatten + Linear head: (B*M, N, D) -> (B*M, T).
       7. Reshape to (B, M, T) and undo RevIN with the saved (mean, std).
 
     Number of patches N = (L - P) // S + 2, where the +2 accounts for the
     standard sliding-window count plus one extra patch from the replicate-pad.
+
     """
 
     def __init__(self,
                  seq_len, pred_len, patch_len, stride,
                  n_features, d_model, n_heads, n_layers,
-                 d_ff, dropout, norm_type="layer"):
+                 d_ff, dropout, norm_type="batch",
+                 use_rope=True):
         super().__init__()
         if norm_type not in {"layer", "batch"}:
             raise ValueError(f"norm_type must be 'layer' or 'batch', got {norm_type!r}")
@@ -83,19 +177,25 @@ class PatchTST(nn.Module):
         self.n_features = n_features
         self.d_model    = d_model
         self.norm_type  = norm_type
+        self.use_rope   = use_rope
         self.n_patches  = (seq_len - patch_len) // stride + 2
 
         self.patch_proj = nn.Linear(patch_len, d_model)
-        self.pos_emb    = nn.Parameter(
-            torch.randn(1, self.n_patches, d_model) * 0.02
-        )
+
+        # pos_emb only exists when RoPE is off; RoPE encodes position inside attn.
+        if not use_rope:
+            self.pos_emb = nn.Parameter(
+                torch.randn(1, self.n_patches, d_model) * 0.02
+            )
 
         if norm_type == "batch":
             self.encoder = nn.Sequential(*[
-                _BNTransformerEncoderLayer(d_model, n_heads, d_ff, dropout)
+                _BNTransformerEncoderLayer(d_model, n_heads, d_ff, dropout,
+                                           use_rope=use_rope)
                 for _ in range(n_layers)
             ])
         else:
+            # LayerNorm path kept for backward compat; use_rope not wired here.
             encoder_layer = nn.TransformerEncoderLayer(
                 d_model         = d_model,
                 nhead           = n_heads,
@@ -128,9 +228,10 @@ class PatchTST(nn.Module):
         x    = torch.cat([x, last], dim=-1)                           # (B*M, L+S)
         x    = x.unfold(-1, self.patch_len, self.stride)              # (B*M, N, P)
 
-        # 4. Project + add position embedding.
+        # 4. Project + optionally add position embedding.
         x = self.patch_proj(x)                                        # (B*M, N, D)
-        x = x + self.pos_emb
+        if not self.use_rope:
+            x = x + self.pos_emb          # RoPE carries position inside attn
 
         # 5. Transformer encoder.
         x = self.encoder(x)                                           # (B*M, N, D)
