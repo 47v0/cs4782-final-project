@@ -14,9 +14,7 @@ Deliverable: train PatchTST with Adam + MSE, early stopping, checkpoint saving;
 
 # The paper trains 1 model per (dataset, prediction_horizon) pair,
 
-import argparse
 import csv
-import os
 import time
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -49,9 +47,10 @@ SMALL_DATASETS = {"ETTh1", "ETTh2", "ILI"}
 
 def paper_cfg() -> Dict:
     return dict(
-        #  Data 
+        #  Data
         dataset         = "ETTh1",
-        data_root       = "../../data/all_six_datasets",
+        # Resolved relative to this file so it works regardless of cwd.
+        data_root       = str(Path(__file__).resolve().parent.parent / "data" / "all_six_datasets"),
         seq_len         = 336,       # look-back window L
         pred_len        = 96,        # forecast horizon T
 
@@ -66,9 +65,10 @@ def paper_cfg() -> Dict:
         d_ff            = 256,       # feed-forward inner dimension F (=2*D)
         dropout         = 0.2,       # dropout probability
 
-        #  Training 
+        #  Training
         batch_size      = 128,
-        lr              = 1e-4,
+        lr              = 1e-4,      # OneCycleLR max_lr
+        pct_start       = 0.3,       # OneCycleLR warm-up fraction (paper's official code default)
         epochs          = 100,
         patience        = 10,        # early-stopping patience (val MSE)
         #  misc 
@@ -170,6 +170,13 @@ class Trainer:
         self.train_loader, self.val_loader, self.test_loader = build_dataloaders(cfg)
         self.model     = model if model is not None else build_model(cfg)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=cfg["lr"])
+        self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            self.optimizer,
+            max_lr          = cfg["lr"],
+            steps_per_epoch = len(self.train_loader),
+            epochs          = cfg["epochs"],
+            pct_start       = cfg["pct_start"],
+        )
         self.criterion = nn.MSELoss()
         self.device    = torch.device(cfg["device"])
 
@@ -213,6 +220,7 @@ class Trainer:
                     # Gradient clipping (good practice for transformers)
                     nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                     self.optimizer.step()
+                    self.scheduler.step()
 
                 with torch.no_grad():
                     total_mse += mse(pred, y).item()
@@ -225,12 +233,13 @@ class Trainer:
     def fit(self) -> Dict:
         # Train for up to cfg['epochs'] epochs with early stopping on val MSE.
 
-        cfg        = self.cfg
-        best_val   = float("inf")
-        best_epoch = 0
-        patience   = cfg["patience"]
-        wait       = 0
-        t0         = time.time()
+        cfg          = self.cfg
+        best_val_mse = float("inf")
+        best_val_mae = float("inf")
+        best_epoch   = 0
+        patience     = cfg["patience"]
+        wait         = 0
+        t0           = time.time()
 
         print(
             f"Training PatchTST | dataset={cfg['dataset']} "
@@ -265,13 +274,14 @@ class Trainer:
                 f"{ep_time:.1f}s"
             )
 
-            #  Checkpoint 
-            if val_mse < best_val:
-                best_val   = val_mse
-                best_epoch = epoch
-                wait       = 0
+            #  Checkpoint
+            if val_mse < best_val_mse:
+                best_val_mse = val_mse
+                best_val_mae = val_mae
+                best_epoch   = epoch
+                wait         = 0
                 torch.save(self.model.state_dict(), self.ckpt_path)
-                print(f"  ===== New best val MSE={best_val:.4f} — checkpoint saved")
+                print(f"  ===== New best val MSE={best_val_mse:.4f} MAE={best_val_mae:.4f} — checkpoint saved")
             else:
                 wait += 1
                 if wait >= patience:
@@ -293,8 +303,8 @@ class Trainer:
         print("=" * 60)
 
         return dict(
-            best_val_mse = best_val,
-            best_val_mae = None,        # stored per epoch in CSV
+            best_val_mse = best_val_mse,
+            best_val_mae = best_val_mae,
             test_mse     = test_mse,
             test_mae     = test_mae,
             best_epoch   = best_epoch,
