@@ -214,6 +214,7 @@ class PatchTST(nn.Module):
                  use_revin_affine=True,   
                  use_decomp=True,       
                  use_channel_attn=True,
+                 use_adap_patch=True,
                  decomp_kernel=25):       
         super().__init__()
         if norm_type not in {"layer", "batch"}:
@@ -230,6 +231,7 @@ class PatchTST(nn.Module):
         self.use_revin_affine = use_revin_affine
         self.use_decomp       = use_decomp
         self.use_channel_attn = use_channel_attn
+        self.use_adap_patch   = use_adap_patch
         self.n_patches        = (seq_len - patch_len) // stride + 2
         self._revin_eps       = 1e-5
 
@@ -277,13 +279,27 @@ class PatchTST(nn.Module):
               dropout=dropout,
           )
 
+        # E5: adaptive patching
+        if self.use_adap_patch:
+          self.patch_importance = nn.Sequential(
+              nn.Linear(self.patch_len, self.d_model),
+              nn.GELU(),
+              nn.Linear(self.d_model, 1)
+          )
+          
         self.flatten = nn.Flatten(start_dim=-2)
         self.head    = nn.Linear(self.n_patches * d_model, pred_len)
 
     def _encode(self, x):
         last = x[:, -1:].expand(-1, self.stride)
         x    = torch.cat([x, last], dim=-1)
-        x    = x.unfold(-1, self.patch_len, self.stride)     # (B*M, N, P)
+        x    = x.unfold(-1, self.patch_len, self.stride) # (B*M, N, P)
+
+        if self.use_adap_patch:
+          weights = self.patch_importance(x)         # (B*M, N, 1)
+          weights = torch.softmax(weights, dim=1)    # normalize across patches
+          x = x * weights                           # reweight patches
+
         x    = self.patch_proj(x)                            # (B*M, N, D)
         if not self.use_rope:
             x = x + self.pos_emb
