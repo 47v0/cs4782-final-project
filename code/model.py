@@ -20,6 +20,41 @@ Extension: Rotary Position Embedding (RoPE) -- Su et al. 2021, arXiv:2104.09864.
 import torch
 import torch.nn as nn
 
+class _ChannelAttention(nn.Module):
+    """
+    Lightweight channel attention (CT-style):
+    lets variables interact before temporal modeling.
+
+    Operates across channels at each time step.
+    """
+
+    def __init__(self, n_channels, d_model, n_heads, dropout):
+        super().__init__()
+        self.proj_in  = nn.Linear(1, d_model)
+        self.attn     = nn.MultiheadAttention(
+            d_model, n_heads, dropout=dropout, batch_first=True
+        )
+        self.proj_out = nn.Linear(d_model, 1)
+        self.drop     = nn.Dropout(dropout)
+
+    def forward(self, x):
+        # x: (B, M, L)
+        B, M, L = x.shape
+
+        # treat channels as tokens
+        x = x.permute(0, 2, 1)        # (B, L, M)
+        x = x.reshape(B * L, M, 1)    # (B*L, M, 1)
+
+        x = self.proj_in(x)           # (B*L, M, D)
+        a, _ = self.attn(x, x, x, need_weights=False)
+        x = x + self.drop(a)
+
+        x = self.proj_out(x)          # (B*L, M, 1)
+
+        x = x.reshape(B, L, M)
+        x = x.permute(0, 2, 1)        # (B, M, L)
+
+        return x
 
 
 def _build_rope_cache(seq_len, head_dim, device, base=10_000.0):
@@ -178,6 +213,7 @@ class PatchTST(nn.Module):
                  use_rope=True,
                  use_revin_affine=True,   
                  use_decomp=True,       
+                 use_channel_attn=True,
                  decomp_kernel=25):       
         super().__init__()
         if norm_type not in {"layer", "batch"}:
@@ -193,6 +229,7 @@ class PatchTST(nn.Module):
         self.use_rope         = use_rope
         self.use_revin_affine = use_revin_affine
         self.use_decomp       = use_decomp
+        self.use_channel_attn = use_channel_attn
         self.n_patches        = (seq_len - patch_len) // stride + 2
         self._revin_eps       = 1e-5
 
@@ -231,6 +268,15 @@ class PatchTST(nn.Module):
             )
             self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
 
+        # E4: channel attention
+        if use_channel_attn:
+          self.channel_attn = _ChannelAttention(
+              n_channels=n_features,
+              d_model=d_model,
+              n_heads=n_heads,
+              dropout=dropout,
+          )
+
         self.flatten = nn.Flatten(start_dim=-2)
         self.head    = nn.Linear(self.n_patches * d_model, pred_len)
 
@@ -255,6 +301,10 @@ class PatchTST(nn.Module):
         x   = (x - mu) / sig
         if self.use_revin_affine:                             # E2: affine in
             x = self.gamma * x + self.beta
+
+        # E4: channel attention
+        if self.use_channel_attn:
+          x = x + self.channel_attn(x)
 
         # 2. Channel-independence: merge M into batch.
         x = x.reshape(B * M, L)                              # (B*M, L)
