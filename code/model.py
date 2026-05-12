@@ -1,20 +1,12 @@
 """
 PatchTST model.
 
-Owner: Person 1
-Deliverable: an nn.Module taking (B, 7, 336) and returning (B, 7, 96).
 Components: instance norm + patching, projection + position embedding,
 Transformer encoder, flatten + linear head.
 
 Reference: Nie et al. 2023 (ICLR), "A Time Series is Worth 64 Words".
 Forward pipeline matches Section 3.1 and Appendix A.1.5; hyperparameter
 defaults follow Appendix A.1.4 (small-dataset override is set in train.py).
-
-Extension: Rotary Position Embedding (RoPE) -- Su et al. 2021, arXiv:2104.09864.
-  Enabled via use_rope=True in the constructor.  When active, the learnable
-  additive pos_emb is dropped and position is encoded by rotating Q and K
-  before every attention dot-product, so the model sees *relative* patch
-  distances rather than absolute indices.  Zero extra parameters.
 """
 
 import torch
@@ -22,15 +14,18 @@ import torch.nn as nn
 
 class _ChannelAttention(nn.Module):
     """
-    Lightweight channel attention (CT-style):
-    lets variables interact before temporal modeling.
+    Lightweight channel attention: lets M variates interact before temporal modeling.
 
-    Operates across channels at each time step.
+    Each time step t is treated as a batch item; the M channels are tokens.
+    A learnable linear projection lifts each scalar value to d_model, runs
+    multi-head self-attention, then projects back to a scalar correction.
+    LayerNorm before attention (pre-norm) stabilises training.
     """
 
-    def __init__(self, n_channels, d_model, n_heads, dropout):
+    def __init__(self, d_model, n_heads, dropout):
         super().__init__()
         self.proj_in  = nn.Linear(1, d_model)
+        self.norm     = nn.LayerNorm(d_model)
         self.attn     = nn.MultiheadAttention(
             d_model, n_heads, dropout=dropout, batch_first=True
         )
@@ -46,7 +41,8 @@ class _ChannelAttention(nn.Module):
         x = x.reshape(B * L, M, 1)    # (B*L, M, 1)
 
         x = self.proj_in(x)           # (B*L, M, D)
-        a, _ = self.attn(x, x, x, need_weights=False)
+        xn = self.norm(x)
+        a, _ = self.attn(xn, xn, xn, need_weights=False)
         x = x + self.drop(a)
 
         x = self.proj_out(x)          # (B*L, M, 1)
@@ -56,6 +52,13 @@ class _ChannelAttention(nn.Module):
 
         return x
 
+"""
+Extension: Rotary Position Embedding (RoPE) -- Su et al. 2021, arXiv:2104.09864.
+  Enabled via use_rope=True in the constructor.  When active, the learnable
+  additive pos_emb is dropped and position is encoded by rotating Q and K
+  before every attention dot-product, so the model sees *relative* patch
+  distances rather than absolute indices.  Zero extra parameters.
+"""
 
 def _build_rope_cache(seq_len, head_dim, device, base=10_000.0):
     inv_freq = 1.0 / (
@@ -272,12 +275,11 @@ class PatchTST(nn.Module):
 
         # E4: channel attention
         if use_channel_attn:
-          self.channel_attn = _ChannelAttention(
-              n_channels=n_features,
+            self.channel_attn = _ChannelAttention(
               d_model=d_model,
               n_heads=n_heads,
               dropout=dropout,
-          )
+            )
 
         # E5: adaptive patching
         if self.use_adap_patch:
