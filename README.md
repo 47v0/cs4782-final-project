@@ -55,39 +55,7 @@ The two trickiest parts: `BatchNorm1d` expects `(B,C,L)` but our tokens are `(B,
 ---
 
 ## Reproduction Steps
-
-**Install dependencies:**
-```bash
-pip install torch>=2.0.0 numpy>=1.24.0 pandas>=2.0.0 matplotlib>=3.7.0
-```
-
-**Get the data.** Download ETTh1 from the [ETDataset repo](https://github.com/zhouhaoyi/ETDataset) and put it in `data/`.
-
-**Run training** from the `code/` directory:
-```bash
-# All extensions on, ETTh1 T=96 (default)
-python train.py
-
-# Specify dataset or prediction horizon
-python train.py --dataset ETTh1 --pred_len 96 --seq_len 336
-
-# Other supported datasets: ETTh2, ETTm1, ETTm2, Weather, Traffic, Electricity, ILI
-python train.py --dataset Weather --pred_len 192
-```
-
-**Ablations.** Extensions are on by default; use `--no_*` flags to turn them off:
-```bash
-# No extensions (clean baseline)
-python train.py --no_rope --no_affine --no_decomp --no_cattn --no_adap
-
-# RoPE only
-python train.py --no_affine --no_decomp --no_cattn --no_adap
-
-# Run the full ablation suite automatically
-python train.py --ablation
-```
-
-Other flags: `--epochs`, `--patience`, `--lr`, `--dropout`. Checkpoints go to `results/checkpoints/`, logs to `results/logs/`.
+**Notebook** All model training and evaluation occurs in the `code/notebooks/03_training.ipynb` python notebook. Each extension can be activated or deactivated by modifying the `cfg` configuration dictionary in the third cell. Running the final cell performs a full sweep across the specified T time steps on the ETTh1 dataset. Checkpoints go to `results/checkpoints/` and logs to `results/logs/`.
 
 **Compute.** We trained on Google Colab GPUs (T4/A100 depending on availability). ETTh1 runs are fast enough to finish comfortably within a Colab session.
 
