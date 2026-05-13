@@ -55,7 +55,7 @@ The two trickiest parts: `BatchNorm1d` expects `(B,C,L)` but our tokens are `(B,
 ---
 
 ## Reproduction Steps
-**Notebook** All model training and evaluation occurs in the `code/notebooks/03_training.ipynb` python notebook. Each extension can be activated or deactivated by modifying the `cfg` configuration dictionary in the third cell. Running the final cell performs a full sweep across the specified T time steps on the ETTh1 dataset. Checkpoints go to `results/checkpoints/` and logs to `results/logs/`.
+**Notebook.** All model training and evaluation occurs in the `code/notebooks/03_training.ipynb` python notebook. Each extension can be activated or deactivated by modifying the `cfg` configuration dictionary in the third cell. Running the final cell performs a full sweep across the specified T time steps on the ETTh1 dataset. Checkpoints go to `results/checkpoints/` and logs to `results/logs/`.
 
 **Compute.** We trained on Google Colab GPUs (T4/A100 depending on availability). ETTh1 runs are fast enough to finish comfortably within a Colab session.
 
